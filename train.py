@@ -1,133 +1,145 @@
-"""
-@author: Viet Nguyen <nhviet1009@gmail.com>
-"""
-import argparse
+from dataclasses import dataclass
 import os
-import shutil
-from random import random, randint, sample
-
-import numpy as np
+import random
 import torch
-import torch.nn as nn
-from tensorboardX import SummaryWriter
+import torch.nn.functional as F
+from torchvision.transforms.functional import rgb_to_grayscale
+from torchvision.transforms import transforms
 
 from src.deep_q_network import DeepQNetwork
 from src.flappy_bird import FlappyBird
-from src.utils import pre_processing
 
 
-def get_args():
-    parser = argparse.ArgumentParser(
-        """Implementation of Deep Q Network to play Flappy Bird""")
-    parser.add_argument("--image_size", type=int, default=84, help="The common width and height for all images")
-    parser.add_argument("--batch_size", type=int, default=32, help="The number of images per batch")
-    parser.add_argument("--optimizer", type=str, choices=["sgd", "adam"], default="adam")
-    parser.add_argument("--lr", type=float, default=1e-6)
-    parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--initial_epsilon", type=float, default=0.1)
-    parser.add_argument("--final_epsilon", type=float, default=1e-4)
-    parser.add_argument("--num_iters", type=int, default=2000000)
-    parser.add_argument("--replay_memory_size", type=int, default=50000,
-                        help="Number of epoches between testing phases")
-    parser.add_argument("--log_path", type=str, default="tensorboard")
-    parser.add_argument("--saved_path", type=str, default="trained_models")
-
-    args = parser.parse_args()
-    return args
+@dataclass
+class Args: 
+    history_length: int = 4
+    gamma: float = 0.99
+    batch_size: int = 32
+    target_iter: int = 2500 # Update every 10000 frames
+    explore_iter: int = 10000 # Update weights after 40000 frames
+    max_iter: int = 1000000 # a.k.a. 4000000 frames
+    eps_init: float = 0.1
+    eps_final: float = 1e-4
+    replay_memory_size: int = 50000
+    lr: float = 2.5e-4
 
 
-def train(opt):
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(123)
-    else:
-        torch.manual_seed(123)
-    model = DeepQNetwork()
-    if os.path.isdir(opt.log_path):
-        shutil.rmtree(opt.log_path)
-    os.makedirs(opt.log_path)
-    writer = SummaryWriter(opt.log_path)
-    optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
-    criterion = nn.MSELoss()
-    game_state = FlappyBird()
-    image, reward, terminal = game_state.next_frame(0)
-    image = pre_processing(image[:game_state.screen_width, :int(game_state.base_y)], opt.image_size, opt.image_size)
-    image = torch.from_numpy(image)
-    if torch.cuda.is_available():
-        model.cuda()
-        image = image.cuda()
-    state = torch.cat(tuple(image for _ in range(4)))[None, :, :, :]
+class ReplayBuffer: 
+    def __init__(self, capacity, history_length, device): 
+        self.capacity = capacity
+        self.device = device
+        self.states = torch.zeros((capacity, history_length, 84, 84))
+        self.next_states = torch.zeros((capacity, history_length, 84, 84))
+        self.actions = torch.zeros(capacity, dtype=torch.long)
+        self.rewards = torch.zeros(capacity)
+        self.terminals = torch.zeros(capacity, dtype=torch.bool)
+        self.pos = 0
+        self.size = 0
+    
+    def push(self, state, action, reward, next_state, terminal):
+        self.states[self.pos] = state.cpu()
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = reward
+        self.next_states[self.pos] = next_state.cpu()
+        self.terminals[self.pos] = terminal
+        self.pos = (self.pos + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+    
+    def sample(self, batch_size):
+        indices = torch.randint(0, self.size, (batch_size,))
+        return (
+            self.states[indices].to(self.device, non_blocking=True),
+            self.actions[indices].to(self.device, non_blocking=True),
+            self.rewards[indices].to(self.device, non_blocking=True),
+            self.next_states[indices].to(self.device, non_blocking=True),
+            self.terminals[indices].to(self.device, non_blocking=True)
+        )
+        
 
-    replay_memory = []
-    iter = 0
-    while iter < opt.num_iters:
-        prediction = model(state)[0]
-        # Exploration or exploitation
-        epsilon = opt.final_epsilon + (
-                (opt.num_iters - iter) * (opt.initial_epsilon - opt.final_epsilon) / opt.num_iters)
-        u = random()
-        random_action = u <= epsilon
-        if random_action:
-            print("Perform a random action")
-            action = randint(0, 1)
-        else:
+os.makedirs('trained_models', exist_ok=True)
+args = Args()
 
-            action = torch.argmax(prediction)[0]
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f'Using device: {device}')
 
-        next_image, reward, terminal = game_state.next_frame(action)
-        next_image = pre_processing(next_image[:game_state.screen_width, :int(game_state.base_y)], opt.image_size,
-                                    opt.image_size)
-        next_image = torch.from_numpy(next_image)
-        if torch.cuda.is_available():
-            next_image = next_image.cuda()
-        next_state = torch.cat((state[0, 1:, :, :], next_image))[None, :, :, :]
-        replay_memory.append([state, action, reward, next_state, terminal])
-        if len(replay_memory) > opt.replay_memory_size:
-            del replay_memory[0]
-        batch = sample(replay_memory, min(len(replay_memory), opt.batch_size))
-        state_batch, action_batch, reward_batch, next_state_batch, terminal_batch = zip(*batch)
+policy_model = DeepQNetwork().to(device)
+target_model = DeepQNetwork().to(device)
+print(f'Number of parameters: {sum(p.numel() for p in policy_model.parameters())}')
 
-        state_batch = torch.cat(tuple(state for state in state_batch))
-        action_batch = torch.from_numpy(
-            np.array([[1, 0] if action == 0 else [0, 1] for action in action_batch], dtype=np.float32))
-        reward_batch = torch.from_numpy(np.array(reward_batch, dtype=np.float32)[:, None])
-        next_state_batch = torch.cat(tuple(state for state in next_state_batch))
+optimizer = torch.optim.Adam(policy_model.parameters(), lr=args.lr, fused=(device=='cuda'))
+replay_buffer = ReplayBuffer(args.replay_memory_size, args.history_length, device)
 
-        if torch.cuda.is_available():
-            state_batch = state_batch.cuda()
-            action_batch = action_batch.cuda()
-            reward_batch = reward_batch.cuda()
-            next_state_batch = next_state_batch.cuda()
-        current_prediction_batch = model(state_batch)
-        next_prediction_batch = model(next_state_batch)
+iter = 0
+game_state = FlappyBird()
+frame_counter = 0
+skip_frames = args.history_length
 
-        y_batch = torch.cat(
-            tuple(reward if terminal else reward + opt.gamma * torch.max(prediction) for reward, terminal, prediction in
-                  zip(reward_batch, terminal_batch, next_prediction_batch)))
+def preprocess(image):
+    img = rgb_to_grayscale(transforms.Resize((84, 84))(
+        torch.from_numpy(image[:game_state.screen_width, :int(game_state.base_y)]).permute(2, 1, 0)
+    ))
+    threshold = 1 
+    binary_img = (img < threshold).float()
+    return binary_img
 
-        q_value = torch.sum(current_prediction_batch * action_batch, dim=1)
+image, reward, terminal = game_state.next_frame(0)
+image = preprocess(image)
+state = torch.cat([image for _ in range(args.history_length)], dim=0)[None, ...]    
+
+if device == 'cuda': 
+    torch.backends.cudnn.benchmark = True
+
+while iter < args.max_iter:
+    policy_model.eval()
+    # Update target model's weights 
+    if iter % args.target_iter == 0: 
+        target_model.load_state_dict(policy_model.state_dict())
+
+    # Update replay memory (online learning paradigm)
+    # Take action based on policy net
+    # Get Q value for each action
+    explore = iter < args.explore_iter
+
+    state = state.to(device)
+    if explore:
+        frame_counter = (frame_counter + 1) % skip_frames
+        action = random.randint(0, 1) if frame_counter == 0 else 0
+    else: 
+        with torch.no_grad():
+            q_values = policy_model(state).squeeze()
+        # Select action using epsilon-greedy
+        eps = args.eps_init + (args.eps_final - args.eps_init) * iter / args.max_iter
+        action = random.randint(0, 1) if random.random() < eps else torch.argmax(q_values).item() 
+
+    next_image, reward, terminal = game_state.next_frame(action)
+
+    # Keep the last 4 frames of the history 
+    next_state = torch.cat([state[0, 1:], preprocess(next_image[:game_state.screen_width, :int(game_state.base_y)]).to(device)])[None, ...]
+    replay_buffer.push(state, action, reward, next_state, terminal)
+
+    if replay_buffer.size >= args.batch_size and not explore:
+        # Train policy net
+        policy_model.train()
+        states, actions, rewards, next_states, terminals = replay_buffer.sample(args.batch_size)
+
+        cur_q_values = policy_model(states) # (B, 2)
+        # Only update q values for taken actions
+        q_values = cur_q_values[range(len(actions)), actions]
+        with torch.no_grad(): 
+            next_q_values = target_model(next_states) # (B, 2)
+        
+        target_q_values = rewards + args.gamma * (~terminals) * next_q_values.max(dim=1)[0]
         optimizer.zero_grad()
-        # y_batch = y_batch.detach()
-        loss = criterion(q_value, y_batch)
+        loss = F.mse_loss(q_values, target_q_values)
         loss.backward()
         optimizer.step()
-
         state = next_state
-        iter += 1
-        print("Iteration: {}/{}, Action: {}, Loss: {}, Epsilon {}, Reward: {}, Q-value: {}".format(
-            iter + 1,
-            opt.num_iters,
-            action,
-            loss,
-            epsilon, reward, torch.max(prediction)))
-        writer.add_scalar('Train/Loss', loss, iter)
-        writer.add_scalar('Train/Epsilon', epsilon, iter)
-        writer.add_scalar('Train/Reward', reward, iter)
-        writer.add_scalar('Train/Q-value', torch.max(prediction), iter)
-        if (iter+1) % 1000000 == 0:
-            torch.save(model, "{}/flappy_bird_{}".format(opt.saved_path, iter+1))
-    torch.save(model, "{}/flappy_bird".format(opt.saved_path))
-
-
-if __name__ == "__main__":
-    opt = get_args()
-    train(opt)
+        if (iter + 1) % 10000 == 0: 
+            checkpoint = {
+                'model_state_dict': policy_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'iter': iter,
+                'epsilon': eps
+            }
+            torch.save(checkpoint, f'trained_models/checkpoint_{iter + 1}.pt')
+    iter += 1
